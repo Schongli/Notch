@@ -1,0 +1,37 @@
+name: Release
+
+# Push a tag like v0.1.0: this builds notch.exe, zips it with the README and LICENSE, and attaches the zip and its
+# SHA-256 sums to a GitHub release.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - name: Package
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          $dir = "notch-$env:TAG-x64"
+          New-Item -ItemType Directory $dir | Out-Null
+          Copy-Item target\release\notch.exe, README.md, LICENSE $dir
+          Compress-Archive -Path "$dir\*" -DestinationPath "$dir.zip"
+          $exe = (Get-FileHash "$dir\notch.exe" -Algorithm SHA256).Hash.ToLower()
+          $zip = (Get-FileHash "$dir.zip" -Algorithm SHA256).Hash.ToLower()
+          "$exe  notch.exe`n$zip  $dir.zip" | Set-Content SHA256SUMS.txt -Encoding ascii
+          "ZIP=$dir.zip" >> $env:GITHUB_ENV
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.ZIP }}
+            SHA256SUMS.txt
+          generate_release_notes: true

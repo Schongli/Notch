@@ -1,0 +1,45 @@
+# notch settings. Save this file and the notch picks up the change right away.
+# Delete a line to go back to its default.
+
+# Opens and pins the notch from anywhere. Ctrl, Alt, Shift, Win + a letter, digit, Space or F1-F12.
+hotkey = "Ctrl+Alt+N"
+
+# Your skin. Colours are #RRGGBB or #RRGGBBAA; sizes are in DIPs (pixels at 100% scaling).
+[theme]
+background = "#000000"
+text = "#FFFFFF"
+font = "Segoe UI Variable Text"
+closed_width = 128
+closed_height = 30
+open_width = 400
+open_height = 170
+radius = 32
+
+# Focus timer lengths in minutes; a long break comes after `rounds` focus sessions.
+[focus]
+focus = 25
+short_break = 5
+long_break = 15
+rounds = 4
+
+# Prayer times are calculated on this PC from your coordinates; nothing is sent anywhere.
+# Leave latitude and longitude at 0 to hide them. Any map shows your coordinates (right-click a spot).
+[prayer]
+latitude = 0.0
+longitude = 0.0
+# Kemenag (Indonesia), Malaysia and Singapore: Fajr 20, Isha 18. Muslim World League: 18 / 17. ISNA: 15 / 15.
+fajr_angle = 20.0
+isha_angle = 18.0
+# Minutes added to every time as a safety margin (ihtiyat). Kemenag uses 2.
+ihtiyat = 2
+# "shafi", or "hanafi" for the later Asr.
+madhab = "shafi"
+# How the five prayers are called, e.g. ["Subuh", "Dzuhur", "Ashar", "Maghrib", "Isya"].
+names = ["Fajr", "Dhuhr", "Asr", "Maghrib", "Isha"]
+# Pause the music when it's time to pray.
+pause_music = true
+
+# Jot: the hotkey opens a box, and what you type is added to this file with the date and time.
+[jot]
+hotkey = "Ctrl+Alt+J"
+file = "%USERPROFILE%\\Documents\\Jot.md"
