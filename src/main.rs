@@ -1,26 +1,34 @@
 #![windows_subsystem = "windows"]
 mod config;
 mod draw;
+mod eyes;
 mod gesture;
 mod input;
 mod lrc;
 mod media;
+mod pages;
 mod rhythm;
 mod shelf;
 mod spring;
 mod system;
+mod water;
 
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Local, NaiveDate, TimeDelta, TimeZone, Timelike, Utc};
 use config::Config;
-use draw::{Activity, FocusView, Hit, Music, Page, Prayers, Renderer, Scene, TOAST_BAR_W, TaskRow, Toast};
+use draw::{
+    AMBER, AQUA, CORAL, Closed, FocusView, Hit, MINT, Music, NEUTRAL, Page, PrayerView, Renderer, Scene, ShelfItem, Slot, TEAL, TOAST_BAR_W,
+    TOAST_TALL, TaskRow, Toast, WaterView, Widget,
+};
+use eyes::Eyes;
 use gesture::{Velocity, lands_open, rubber};
 use input::{Ask, WM_ASKED};
 use media::{Media, NowPlaying, WM_MEDIA};
-use rhythm::{Focus, Phase, Task};
+use pages::DROP;
+use rhythm::{Focus, FocusLog, Phase, Task};
 use spring::Spring;
 use system::{Audio, Power, WM_AUDIO_DEVICE, WM_CAPS, WM_VOLUME};
 use windows::Win32::Foundation::*;
@@ -32,7 +40,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Ole::{OleInitialize, RevokeDragDrop};
 use windows::Win32::System::Power::RegisterPowerSettingNotification;
 use windows::Win32::System::Registry::*;
-use windows::Win32::System::SystemInformation::GetLocalTime;
+use windows::Win32::System::SystemInformation::{GetLocalTime, GetTickCount};
 use windows::Win32::System::SystemServices::{GUID_ACDC_POWER_SOURCE, GUID_BATTERY_PERCENTAGE_REMAINING};
 use windows::Win32::System::Threading::*;
 use windows::Win32::UI::HiDpi::*;
@@ -52,10 +60,13 @@ const TIMER_CLOCK: usize = 3;
 const TIMER_MEDIA: usize = 4;
 const TIMER_TOAST: usize = 5;
 const TIMER_RHYTHM: usize = 6;
+const TIMER_EYES: usize = 7;
 const HOTKEY_ID: i32 = 1;
 const JOT_HOTKEY_ID: i32 = 2;
-const MUSIC_PAGES: &[Page] = &[Page::Music, Page::Lyrics, Page::Clock, Page::Focus, Page::Todo, Page::Shelf];
-const CLOCK_PAGES: &[Page] = &[Page::Clock, Page::Focus, Page::Todo, Page::Shelf];
+/// How long the pointer rests on the closed notch before it opens. Passing over it on the way to a tab doesn't count.
+const DWELL_MS: u32 = 220;
+/// Faster than this (DIPs a second) the pointer is passing by, not stopping.
+const PASSING: f32 = 350.0;
 // Icon glyphs (Segoe Fluent Icons / MDL2)
 const STOPWATCH: &str = "\u{E916}";
 const MOON: &str = "\u{E708}";
@@ -98,6 +109,55 @@ struct Drag {
     hit: Option<Hit>,
 }
 
+/// A pop-up in the closed notch.
+struct Pop {
+    glyph: String,
+    title: String,
+    sub: Option<String>,
+    value: Option<String>,
+    level: Option<f32>,
+    tint: [f32; 3],
+    ring: Option<f32>,
+}
+
+impl Pop {
+    fn new(glyph: &str, title: impl Into<String>) -> Self {
+        Pop { glyph: glyph.into(), title: title.into(), sub: None, value: None, level: None, tint: NEUTRAL, ring: None }
+    }
+
+    fn sub(self, s: impl Into<String>) -> Self {
+        Pop { sub: Some(s.into()), ..self }
+    }
+
+    fn tint(self, tint: [f32; 3]) -> Self {
+        Pop { tint, ..self }
+    }
+}
+
+/// What the closed notch shows when there's no pop-up, most important first.
+#[derive(Clone, PartialEq)]
+enum Rest {
+    /// A focus timer runs: minutes left, the round
+    Focus {
+        left: String,
+        ring: f32,
+        round: String,
+        on_break: bool,
+    },
+    /// Music plays
+    Music,
+    /// Music plays and [music] lyrics_in_pill is on
+    Lyric(String),
+    /// A prayer within half an hour
+    Prayer {
+        name: String,
+        until: String,
+    },
+    /// Nothing going on for a while
+    Eyes,
+    Clock,
+}
+
 struct App {
     hwnd: HWND,
     r: Renderer,
@@ -110,8 +170,26 @@ struct App {
     h: Spring,
     radius: Spring,
     mix: Spring,
+    /// Hover before opening: the notch grows a touch and lightens
+    peek: Spring,
+    /// Scale of the pressed button
+    press: Spring,
+    pressed: Option<Hit>,
+    hover: Option<Hit>,
+    arrow_l: Spring,
+    arrow_r: Spring,
+    /// Pop-up entrance, 0 → 1
+    pop: Spring,
+    /// The closed music bars jump once on a new track
+    hop: Spring,
+    /// Eyelids, 0 open → 1 shut, and the wake-up bounce
+    lid: Spring,
+    bounce: Spring,
     last: Instant,
     hovered: bool,
+    /// Last pointer position over the notch and its speed, to tell stopping from passing by
+    pointer: Option<(f32, f32, Instant)>,
+    speed: f32,
     open: bool,
     /// Opened by click or hotkey: stays open, has keyboard focus, closes on Esc or a click elsewhere.
     pinned: bool,
@@ -126,22 +204,31 @@ struct App {
     /// Lyric line slide, 1 → 0 each time a new line starts
     slide: Spring,
     line: Option<usize>,
-    /// Touchpad horizontal swipes arrive in small steps; a page turns every 120.
+    lyrics_on: bool,
+    /// Touchpad swipes and wheels arrive in small steps; a page turns (or a list scrolls) every 120.
     hwheel: i32,
+    vwheel: i32,
+    task_scroll: usize,
+    shelf_scroll: usize,
     /// Where we just seeked to, shown until the player reports back.
     seek_hold: Option<(u64, Instant)>,
     audio: Option<Audio>,
-    /// (glyph, text, level) of the pop-up showing in the closed pill
-    toast: Option<(String, String, Option<f32>)>,
+    toast: Option<Pop>,
     plugged: Option<bool>,
     battery: Option<u32>,
     focus: Focus,
+    focus_log: FocusLog,
     tasks: Vec<Task>,
+    water: water::Day,
+    eyes: Eyes,
+    /// Nothing was going on at the last look (for the eyes' quiet clock)
+    quiet: bool,
     /// Today's prayer times, worked out once a day (or when settings change).
     prayer_cache: Option<(NaiveDate, Option<[DateTime<Utc>; 5]>)>,
     /// Up to when prayers have been announced.
     prayer_seen: DateTime<Utc>,
     shelf: Vec<String>,
+    shelf_items: Vec<ShelfItem>,
     drop_hover: bool,
     /// The notch opened because files were dragged onto it, so it closes again after.
     drop_opened: bool,
@@ -164,18 +251,101 @@ fn reduced_motion() -> bool {
     !on.as_bool()
 }
 
+/// How long since any keyboard or mouse input on the PC.
+fn pc_idle() -> Duration {
+    let mut li = LASTINPUTINFO { cbSize: size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
+    unsafe { if GetLastInputInfo(&mut li).as_bool() { Duration::from_millis(GetTickCount().wrapping_sub(li.dwTime) as u64) } else { Duration::ZERO } }
+}
+
+/// "2.4 MB"
+fn file_size(bytes: u64) -> String {
+    let b = bytes as f64;
+    if b < 1024.0 {
+        format!("{bytes} B")
+    } else if b < 1024.0 * 1024.0 {
+        format!("{:.0} KB", b / 1024.0)
+    } else if b < 1024.0 * 1024.0 * 1024.0 {
+        format!("{:.1} MB", b / 1024.0 / 1024.0)
+    } else {
+        format!("{:.1} GB", b / 1024.0 / 1024.0 / 1024.0)
+    }
+}
+
+fn shelf_items(paths: &[String]) -> Vec<ShelfItem> {
+    (paths.iter())
+        .map(|p| {
+            let size = match std::fs::metadata(p) {
+                Ok(m) if m.is_dir() => "Folder".into(),
+                Ok(m) => file_size(m.len()),
+                Err(_) => "Missing".into(),
+            };
+            ShelfItem { path: p.clone(), name: shelf::name(p).to_string(), size }
+        })
+        .collect()
+}
+
 impl App {
-    /// The closed pill hugs what it shows: the clock, or the cover and lyric line while music plays.
+    /// Something live in the closed notch, if anything: a running focus timer, music, a prayer within 30 minutes.
+    fn live(&self) -> Option<Rest> {
+        if self.focus.running() {
+            let f = &self.focus;
+            let left = f.remaining(Instant::now());
+            return Some(Rest::Focus {
+                left: rhythm::minutes_left(left),
+                ring: left.as_secs_f32() / rhythm::length(&self.cfg.focus, f.phase).as_secs_f32(),
+                round: format!("{}/{}", f.round, self.cfg.focus.rounds.max(1)),
+                on_break: f.phase != Phase::Focus,
+            });
+        }
+        if let Some(np) = self.np.as_ref().filter(|n| n.playing) {
+            let line = self.line.and_then(|i| np.lyrics.get(i)).filter(|l| np.lyrics_ready() && !l.text.is_empty());
+            return Some(match line {
+                Some(l) if self.cfg.music.lyrics_in_pill => Rest::Lyric(l.text.clone()),
+                _ => Rest::Music,
+            });
+        }
+        let now = Utc::now();
+        let (i, t) = rhythm::next_prayer(&self.cfg.prayer, now)?;
+        (t - now <= TimeDelta::minutes(30)).then(|| Rest::Prayer {
+            name: self.cfg.prayer.names.get(i).cloned().unwrap_or_default(),
+            until: format!("{}m", ((t - now).num_seconds() + 59) / 60),
+        })
+    }
+
+    fn rest(&self) -> Rest {
+        self.live().unwrap_or(if self.eyes.showing(Instant::now()) { Rest::Eyes } else { Rest::Clock })
+    }
+
+    /// Line style, while there's nothing to show and the pointer isn't on it.
+    fn line_mode(&self) -> bool {
+        self.cfg.theme.style == "line" && !self.hovered && self.toast.is_none()
+    }
+
+    /// The closed notch hugs what it shows: a compact three-slot activity, the eyes, the clock, or a pop-up.
     fn closed(&self) -> Shape {
         let t = &self.cfg.theme;
-        let fit = |text: &str, side: f32| (self.r.measure(text) + side + 16.0).clamp(t.closed_width, self.r.box_w - 24.0);
-        let w = match (&self.toast, self.activity()) {
-            (Some((_, _, Some(_))), _) => TOAST_BAR_W.min(self.r.box_w - 24.0),
-            (Some((_, text, None)), _) => fit(text, 8.0 + (t.closed_height - 6.0) + 8.0),
-            (None, Some((_, text))) => fit(&text, 6.0 + (t.closed_height - 10.0) + 9.0),
-            (None, None) => t.closed_width,
+        let h = t.closed_height;
+        let max = self.r.box_w - 24.0;
+        if let Some(p) = &self.toast {
+            if p.level.is_some() {
+                return Shape { w: TOAST_BAR_W.min(max), h, r: h / 2.0 };
+            }
+            // Two-line pop-ups are taller; the padding matches draw.rs's toast layout.
+            let (h, pad) = if p.sub.is_some() { (TOAST_TALL, 59.0) } else { (h, 47.0) };
+            let w = (self.r.measure_toast(&p.title, p.sub.as_deref(), p.value.as_deref()) + pad).clamp(t.closed_width, max);
+            return Shape { w, h, r: h / 2.0 };
+        }
+        let live = |center: &str| (self.r.measure(center) + 2.0 * (h + 6.0) + 12.0).clamp(t.closed_width, 220.0);
+        let w = match self.rest() {
+            Rest::Clock if self.line_mode() => return Shape { w: t.closed_width, h: 4.0, r: 2.0 },
+            Rest::Clock => t.closed_width,
+            Rest::Eyes => 96.0,
+            Rest::Lyric(text) => (self.r.measure(&text) + 6.0 + (h - 10.0) + 9.0 + 14.0).clamp(t.closed_width, max),
+            Rest::Music => live(&self.time),
+            Rest::Focus { left, .. } => live(&left),
+            Rest::Prayer { name, .. } => live(&name),
         };
-        Shape { w, h: t.closed_height, r: t.closed_height / 2.0 }
+        Shape { w, h, r: h / 2.0 }
     }
 
     fn opened(&self) -> Shape {
@@ -188,12 +358,66 @@ impl App {
         [&mut self.w, &mut self.h, &mut self.radius, &mut self.mix]
     }
 
-    fn animating(&self) -> bool {
-        ![self.w, self.h, self.radius, self.mix, self.page, self.slide].iter().all(Spring::is_settled)
+    fn all_springs(&mut self) -> [&mut Spring; 14] {
+        [
+            &mut self.w,
+            &mut self.h,
+            &mut self.radius,
+            &mut self.mix,
+            &mut self.page,
+            &mut self.slide,
+            &mut self.peek,
+            &mut self.press,
+            &mut self.arrow_l,
+            &mut self.arrow_r,
+            &mut self.pop,
+            &mut self.hop,
+            &mut self.lid,
+            &mut self.bounce,
+        ]
     }
 
-    fn pages(&self) -> &'static [Page] {
-        if self.np.is_some() { MUSIC_PAGES } else { CLOCK_PAGES }
+    fn animating(&self) -> bool {
+        let s = [
+            self.w,
+            self.h,
+            self.radius,
+            self.mix,
+            self.page,
+            self.slide,
+            self.peek,
+            self.press,
+            self.arrow_l,
+            self.arrow_r,
+            self.pop,
+            self.hop,
+            self.lid,
+            self.bounce,
+        ];
+        !s.iter().all(Spring::is_settled)
+    }
+
+    /// Call before nudging a spring: if nothing was moving, the next frame's time step starts now.
+    fn wake(&mut self) {
+        if !self.animating() {
+            self.last = Instant::now();
+        }
+    }
+
+    fn pages(&self) -> Vec<Page> {
+        let mut p = Vec::with_capacity(7);
+        if self.np.is_some() {
+            p.push(Page::Music);
+        }
+        p.push(Page::Focus);
+        if self.cfg.prayer.latitude != 0.0 || self.cfg.prayer.longitude != 0.0 {
+            p.push(Page::Prayer);
+        }
+        if self.cfg.water.enabled {
+            p.push(Page::Water);
+        }
+        p.extend([Page::Todo, Page::Widgets, Page::Shelf]);
+        p
     }
 
     fn position(&self) -> u64 {
@@ -204,49 +428,32 @@ impl App {
         }
     }
 
-    /// What the closed pill shows instead of the clock, most important first: a running focus timer,
-    /// music (the line being sung, else title and artist; glyph None = album cover), a prayer within 30 minutes.
-    fn activity(&self) -> Option<(Option<&'static str>, String)> {
-        if self.focus.running() {
-            let left = rhythm::minutes_left(self.focus.remaining(Instant::now()));
-            let what = if self.focus.phase == Phase::Focus { "Focus" } else { "Break" };
-            return Some((Some(STOPWATCH), format!("{what} · {left}")));
-        }
-        if let Some(np) = self.np.as_ref().filter(|n| n.playing) {
-            let line = self.line.and_then(|i| np.lyrics.get(i)).filter(|l| np.lyrics_ready() && !l.text.is_empty());
-            return Some((
-                None,
-                match line {
-                    Some(l) => l.text.clone(),
-                    None if np.artist.is_empty() => np.title.clone(),
-                    None => format!("{} · {}", np.title, np.artist),
-                },
-            ));
-        }
-        let now = Utc::now();
-        let (i, t) = rhythm::next_prayer(&self.cfg.prayer, now)?;
-        (t - now <= chrono::TimeDelta::minutes(30)).then(|| (Some(MOON), format!("{} in {}", self.cfg.prayer.names[i], rhythm::until(t - now))))
-    }
-
     fn page_now(&self) -> Option<Page> {
         self.pages().get(self.page.target.round() as usize).copied()
     }
 
     fn go_page(&mut self, page: f32) {
-        if self.page.is_settled() {
-            self.last = Instant::now();
-        }
+        self.wake();
         self.page.target = page.clamp(0.0, (self.pages().len() - 1) as f32).round();
+        self.schedule(); // the seek bar ticks only on the music page
         self.schedule_rhythm(); // the focus page ticks every second while it shows
     }
 
     /// Picks up a new snapshot from the media thread.
     fn on_media(&mut self) {
         let showing = self.page_now();
+        let old = self.np.as_ref().map(|n| n.key.clone());
         self.np = self.media.snapshot();
         self.seek_hold = None;
         match &self.np {
-            Some(n) => self.r.set_cover(&n.key, n.cover.as_ref()),
+            Some(n) => {
+                self.r.set_cover(&n.key, n.cover.as_ref());
+                // A new track: the closed bars hop once.
+                if n.playing && old.is_some_and(|k| k != n.key) {
+                    self.wake();
+                    self.hop.value = 1.0;
+                }
+            }
             None => self.r.set_cover("", None),
         }
         // Music pages come and go; stay on the page you were looking at.
@@ -257,7 +464,7 @@ impl App {
             self.page.value = self.page.target;
         }
         self.update_line(false);
-        self.set_open(self.open); // the closed width follows the activity text
+        self.set_open(self.open); // the closed width follows what's live
         self.render();
         self.schedule();
     }
@@ -267,31 +474,32 @@ impl App {
         let pos = self.position();
         let line = self.np.as_ref().filter(|n| n.lyrics_ready()).and_then(|n| lrc::current(&n.lyrics, pos));
         if line != self.line {
-            // The slide is only visible on the open lyrics page; closed, the line just swaps.
+            // The slide is only visible on the open music page; elsewhere the line just swaps.
             if animate && self.open && line.is_some() && line == self.line.map(|i| i + 1) {
-                if !self.animating() {
-                    self.last = Instant::now();
-                }
+                self.wake();
                 self.slide.value = 1.0;
             }
             self.line = line;
         }
     }
 
-    /// One timer, set for the next thing that changes on screen: a lyric line, or the seek bar while open.
+    /// One timer, set for the next thing that changes on screen: the seek bar and lyrics on the open music page, or
+    /// the line in the closed pill when lyrics_in_pill is on. Nothing at all while closed otherwise.
     fn schedule(&mut self) {
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIMER_MEDIA);
         }
         let Some(np) = self.np.as_ref().filter(|n| n.playing) else { return };
         let pos = self.position();
-        let mut wait = if self.open { 500 } else { u64::MAX };
-        if let Some(next) = np.lyrics.iter().find(|l| l.ms > pos).filter(|_| np.lyrics_ready()) {
+        let on_page = self.open && self.page_now() == Some(Page::Music);
+        let mut wait = if on_page { 500 } else { u64::MAX };
+        let lines = (on_page && self.lyrics_on) || (!self.open && self.cfg.music.lyrics_in_pill);
+        if lines && let Some(next) = np.lyrics.iter().find(|l| l.ms > pos).filter(|_| np.lyrics_ready()) {
             wait = wait.min(next.ms - pos + 15);
         }
-        // Word by word, but only where it shows: the open lyrics page.
-        if self.open
-            && self.page_now() == Some(Page::Lyrics)
+        // Word by word, but only where it shows.
+        if on_page
+            && self.lyrics_on
             && let Some(word) = self.line.and_then(|i| np.lyrics.get(i)).and_then(|l| l.words.iter().find(|w| w.ms > pos))
         {
             wait = wait.min(word.ms - pos + 15);
@@ -303,9 +511,11 @@ impl App {
         }
     }
 
-    /// A pop-up in the closed pill for `ms`; the pill springs to fit it and back.
-    fn show_toast(&mut self, glyph: &str, text: String, level: Option<f32>, ms: u32) {
-        self.toast = Some((glyph.to_string(), text, level));
+    /// A pop-up in the closed notch for `ms`; the notch springs to fit it and back.
+    fn show_toast(&mut self, pop: Pop, ms: u32) {
+        self.toast = Some(pop);
+        self.wake();
+        (self.pop.value, self.pop.target) = (0.0, 1.0);
         unsafe {
             SetTimer(Some(self.hwnd), TIMER_TOAST, ms, None);
         }
@@ -320,6 +530,22 @@ impl App {
             self.prayer_cache = Some((today, rhythm::prayer_day(&self.cfg.prayer, today)));
         }
         self.prayer_cache.as_ref().and_then(|(_, t)| *t)
+    }
+
+    /// Today's water, started fresh after midnight.
+    fn water_day(&mut self) -> &mut water::Day {
+        let today = Local::now().date_naive();
+        if self.water.date != Some(today) {
+            self.water = std::mem::take(&mut self.water).today(today);
+        }
+        &mut self.water
+    }
+
+    fn log_focus(&mut self, spent: Duration, finished: bool) {
+        if !spent.is_zero() || finished {
+            self.focus_log.add(Local::now().date_naive(), spent, finished);
+            self.focus_log.save();
+        }
     }
 
     fn task_rows(&self) -> Vec<TaskRow> {
@@ -355,20 +581,25 @@ impl App {
             Ask::Task => {
                 let (words, at) = rhythm::split_time(&text);
                 let due = at.map(|t| rhythm::next_at(t, Local::now()));
-                let note = due.map_or(String::new(), |d| format!(" · {}", d.format("%H:%M")));
+                let sub = due.map_or("Added to your list".into(), |d| format!("Added · reminder at {}", d.format("%H:%M")));
                 self.tasks.push(Task { text: words.clone(), due: due.map(|d| d.timestamp()), done: false, reminded: false });
                 rhythm::save_tasks(&self.tasks);
-                self.show_toast(CHECK, format!("Added: {words}{note}"), None, 2500);
+                self.show_toast(Pop::new(CHECK, words).sub(sub).tint(MINT), 2500);
                 self.schedule_rhythm();
             }
             Ask::Jot => {
                 let file = expand_env(&self.cfg.jot.file);
                 match rhythm::jot(&file, &text, Local::now()) {
-                    Ok(()) => self.show_toast(NOTE, "Jotted".into(), None, 1600),
-                    Err(e) => self.show_toast(NOTE, format!("Couldn't jot: {e}"), None, 5000),
+                    Ok(()) => self.show_toast(Pop::new(NOTE, "Jotted"), 1600),
+                    Err(e) => self.show_toast(Pop::new(NOTE, "Couldn't jot").sub(e.to_string()).tint(AMBER), 5000),
                 }
             }
         }
+    }
+
+    fn refresh_shelf(&mut self) {
+        self.shelf_items = shelf_items(&self.shelf);
+        self.shelf_scroll = self.shelf_scroll.min(self.shelf.len().saturating_sub(5));
     }
 
     /// Files dragged over the notch: open on the shelf, take them on drop, close again if the drag opened it.
@@ -397,6 +628,7 @@ impl App {
                 self.drop_hover = false;
                 shelf::add(&mut self.shelf, shelf::take_dropped());
                 shelf::save(&self.shelf);
+                self.refresh_shelf();
                 // Show what landed for a moment, then tuck away.
                 if std::mem::take(&mut self.drop_opened) {
                     unsafe {
@@ -408,17 +640,21 @@ impl App {
         self.render();
     }
 
-    /// Wakes for whatever is due: a focus phase ending, a task reminder, a prayer.
+    /// Wakes for whatever is due: a focus phase ending, a task reminder, a prayer, a sip of water.
     fn tick_rhythm(&mut self) {
         let (now_i, now) = (Instant::now(), Utc::now());
         if self.focus.running() && self.focus.remaining(now_i).is_zero() {
-            let text = match self.focus.advance(&self.cfg.focus, now_i) {
-                Some(Phase::Focus) => format!("Back to focus · round {}", self.focus.round),
-                Some(Phase::Short) => format!("Short break · {} min", self.cfg.focus.short_break),
-                Some(Phase::Long) => format!("Long break · {} min", self.cfg.focus.long_break),
-                None => "Focus cycle done. Well done!".into(),
+            if self.focus.phase == Phase::Focus {
+                let spent = self.focus.focused(&self.cfg.focus, now_i);
+                self.log_focus(spent, true);
+            }
+            let (text, tint) = match self.focus.advance(&self.cfg.focus, now_i) {
+                Some(Phase::Focus) => (format!("Back to focus · round {}", self.focus.round), CORAL),
+                Some(Phase::Short) => (format!("Short break · {} min", self.cfg.focus.short_break), TEAL),
+                Some(Phase::Long) => (format!("Long break · {} min", self.cfg.focus.long_break), TEAL),
+                None => ("Focus cycle done. Well done!".into(), CORAL),
             };
-            self.show_toast(STOPWATCH, text, None, 5000);
+            self.show_toast(Pop::new(STOPWATCH, text).tint(tint), 5000);
         }
         let mut changed = false;
         for i in 0..self.tasks.len() {
@@ -427,7 +663,7 @@ impl App {
                 let text = t.text.clone();
                 self.tasks[i].reminded = true;
                 changed = true;
-                self.show_toast(ALARM, text, None, 10_000);
+                self.show_toast(Pop::new(ALARM, text).sub("Reminder").tint(MINT), 10_000);
             }
         }
         if changed {
@@ -437,9 +673,10 @@ impl App {
         if let Some((i, t)) = rhythm::next_prayer(&self.cfg.prayer, self.prayer_seen)
             && t <= now
         {
-            if now - t < chrono::TimeDelta::minutes(10) {
+            if now - t < TimeDelta::minutes(10) {
                 let name = self.cfg.prayer.names[i].clone();
-                self.show_toast(MOON, format!("{name} · {}", t.with_timezone(&Local).format("%H:%M")), None, 10_000);
+                let at = t.with_timezone(&Local).format("%H:%M");
+                self.show_toast(Pop::new(MOON, name).sub(format!("{at} · time to pray")).tint(AMBER), 10_000);
                 if self.cfg.prayer.pause_music && self.np.as_ref().is_some_and(|n| n.playing) {
                     self.media.pause();
                 }
@@ -447,6 +684,16 @@ impl App {
             self.prayer_seen = t;
         } else {
             self.prayer_seen = now;
+        }
+        // Water: a nudge only when you're behind your pace, and not too often.
+        let (cfg, local) = (self.cfg.water.clone(), Local::now());
+        let day = self.water_day();
+        if water::nudge_due(&cfg, day, local) {
+            day.nudged = Some(local.timestamp());
+            let total = day.total();
+            water::save(day);
+            let sub = format!("{} of {} L so far", water::litres(total), water::litres(cfg.goal_ml));
+            self.show_toast(Pop::new(DROP, "Time for some water").sub(sub).tint(AQUA), 8000);
         }
         self.set_open(self.open);
         self.render();
@@ -477,6 +724,10 @@ impl App {
             // Long sleeps drift (the PC may sleep in between); check back at least every 10 minutes.
             wait = wait.min(10 * 60_000);
         }
+        if self.cfg.water.enabled && self.cfg.water.remind_every > 0 {
+            // Whether you're behind is a slow thing; a look every five minutes is plenty.
+            wait = wait.min(5 * 60_000);
+        }
         if wait != u64::MAX {
             unsafe {
                 SetTimer(Some(self.hwnd), TIMER_RHYTHM, wait.clamp(50, 10 * 60_000) as u32, None);
@@ -484,14 +735,63 @@ impl App {
         }
     }
 
+    /// The eyes come out after a quiet while; this keeps their clock and timer right. Called whenever things change.
+    fn schedule_eyes(&mut self) {
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), TIMER_EYES);
+        }
+        let now = Instant::now();
+        let quiet = !self.open && !self.hovered && self.toast.is_none() && self.live().is_none();
+        // Busy restarts the quiet clock, and so does the moment it turns quiet.
+        if !quiet || !self.quiet {
+            self.eyes.poke(now);
+            (self.lid.value, self.lid.target, self.lid.velocity) = (0.0, 0.0, 0.0);
+        }
+        self.quiet = quiet;
+        if !quiet {
+            return;
+        }
+        let wait = if self.eyes.showing(now) { Some(self.eyes.next_tick(now)) } else { self.eyes.due_in(now) };
+        if let Some(w) = wait {
+            unsafe {
+                SetTimer(Some(self.hwnd), TIMER_EYES, w.as_millis().clamp(50, 3_600_000) as u32, None);
+            }
+        }
+    }
+
+    fn on_eyes(&mut self) {
+        match self.eyes.tick(Instant::now(), pc_idle()) {
+            // A quick shut-and-open: a kick to a spring that rests open.
+            Some(eyes::Event::Blink) => {
+                self.wake();
+                self.lid.velocity = 82.0;
+            }
+            Some(eyes::Event::Doze) => {
+                self.wake();
+                self.lid.target = 1.0;
+            }
+            Some(eyes::Event::Wake) => {
+                self.wake();
+                self.lid.target = 0.0;
+                self.bounce.velocity = 28.0;
+            }
+            None => {}
+        }
+        self.set_open(self.open); // the first time out, the clock's pill becomes the eyes' pill
+        self.render();
+    }
+
     fn on_power(&mut self, p: Power) {
         match p {
             Power::Plugged(on) => {
                 // The first report is just the state at startup, not a change.
                 if self.plugged.is_some_and(|was| was != on) {
-                    let pct = self.battery.map_or(String::new(), |b| format!(" · {b}%"));
-                    let glyph = system::battery_glyph(self.battery.unwrap_or(100), on);
-                    self.show_toast(&glyph, format!("{}{pct}", if on { "Charging" } else { "On battery" }), None, 2500);
+                    let pct = self.battery.unwrap_or(100);
+                    let glyph = system::battery_glyph(pct, on);
+                    let (title, sub) = if on { ("Charger connected", "Charging") } else { ("Charger unplugged", "On battery") };
+                    let mut pop = Pop::new(&glyph, title).sub(format!("{sub} · {pct}%")).tint(if on { MINT } else { NEUTRAL });
+                    pop.ring = Some(pct as f32 / 100.0);
+                    self.show_toast(pop, 2500);
                 }
                 self.plugged = Some(on);
             }
@@ -499,7 +799,9 @@ impl App {
                 if let (Some(old), Some(false)) = (self.battery, self.plugged)
                     && system::crossed_low(old, now)
                 {
-                    self.show_toast(&system::battery_glyph(now, false), format!("Battery low · {now}%"), None, 5000);
+                    let mut pop = Pop::new(&system::battery_glyph(now, false), "Battery low").sub(format!("{now}% left")).tint(AMBER);
+                    pop.ring = Some(now as f32 / 100.0);
+                    self.show_toast(pop, 5000);
                 }
                 self.battery = Some(now);
             }
@@ -507,22 +809,33 @@ impl App {
     }
 
     fn act(&mut self, hit: Hit, x: f32) {
+        let now = Instant::now();
         match hit {
             Hit::Previous => self.media.previous(),
             Hit::Next => self.media.next(),
             Hit::PlayPause => self.media.toggle(),
             Hit::Seek { left, right } => self.seek_to_x(x, left, right),
             Hit::Line(ms) => self.seek(ms),
+            Hit::LyricsToggle => {
+                self.lyrics_on = !self.lyrics_on;
+                self.schedule();
+            }
             Hit::Page(i) => self.go_page(i as f32),
-            Hit::FocusToggle => self.focus.toggle(Instant::now()),
+            Hit::FocusToggle => self.focus.toggle(now),
             Hit::FocusSkip => {
                 if self.focus.started {
-                    self.focus.advance(&self.cfg.focus, Instant::now());
+                    let spent = self.focus.focused(&self.cfg.focus, now);
+                    self.log_focus(spent, false);
+                    self.focus.advance(&self.cfg.focus, now);
                 } else {
-                    self.focus.toggle(Instant::now());
+                    self.focus.toggle(now);
                 }
             }
-            Hit::FocusReset => self.focus = Focus::new(&self.cfg.focus),
+            Hit::FocusReset => {
+                let spent = self.focus.focused(&self.cfg.focus, now);
+                self.log_focus(spent, false);
+                self.focus = Focus::new(&self.cfg.focus);
+            }
             Hit::AddTask => self.ask(Ask::Task),
             Hit::Task(i) => {
                 if let Some(t) = self.tasks.get_mut(i) {
@@ -534,6 +847,17 @@ impl App {
                 self.tasks.retain(|t| !t.done);
                 rhythm::save_tasks(&self.tasks);
             }
+            Hit::Drink => {
+                let ml = self.cfg.water.glass_ml;
+                let day = self.water_day();
+                day.drink(Local::now(), ml);
+                water::save(day);
+            }
+            Hit::Undrink => {
+                let day = self.water_day();
+                day.undo();
+                water::save(day);
+            }
             Hit::ShelfItem(i) => {
                 let Some(path) = self.shelf.get(i).cloned() else { return };
                 let ok =
@@ -542,27 +866,27 @@ impl App {
                     // Moved or deleted since it was shelved.
                     self.shelf.remove(i);
                     shelf::save(&self.shelf);
-                    self.show_toast("\u{E783}", format!("Can't open {}", shelf::name(&path)), None, 3000);
+                    self.refresh_shelf();
+                    self.show_toast(Pop::new("\u{E783}", "Can't open it").sub(shelf::name(&path).to_string()).tint(AMBER), 3000);
                 }
             }
             Hit::ShelfRemove(i) => {
                 if i < self.shelf.len() {
                     self.shelf.remove(i);
                     shelf::save(&self.shelf);
+                    self.refresh_shelf();
                 }
             }
             Hit::ShelfClear => {
                 self.shelf.clear();
                 shelf::save(&self.shelf);
+                self.refresh_shelf();
             }
-        }
-        if matches!(hit, Hit::ShelfRemove(_) | Hit::ShelfClear) {
-            self.render();
         }
         if matches!(hit, Hit::FocusToggle | Hit::FocusSkip | Hit::FocusReset | Hit::Task(_) | Hit::ClearDone) {
             self.schedule_rhythm();
-            self.render();
         }
+        self.render();
     }
 
     fn seek(&mut self, ms: u64) {
@@ -591,11 +915,13 @@ impl App {
     }
 
     fn set_open(&mut self, open: bool) {
-        if !self.animating() {
-            self.last = Instant::now();
-        }
+        self.wake();
         let changed = self.open != open;
         self.open = open;
+        if changed && open {
+            self.update_line(false); // not followed while closed
+            self.peek.target = 0.0;
+        }
         let s = if open { self.opened() } else { self.closed() };
         (self.w.target, self.h.target, self.radius.target) = (s.w, s.h, s.r);
         self.mix.target = if open { 1.0 } else { 0.0 };
@@ -604,6 +930,7 @@ impl App {
             self.schedule();
             self.schedule_rhythm();
         }
+        self.schedule_eyes();
     }
 
     /// Hover never takes focus; a pinned notch needs it for the keyboard and to notice clicks elsewhere.
@@ -688,72 +1015,184 @@ impl App {
         let now = Instant::now();
         let dt = (now - self.last).as_secs_f32();
         self.last = now;
-        for s in [&mut self.w, &mut self.h, &mut self.radius, &mut self.mix, &mut self.page, &mut self.slide] {
+        for s in self.all_springs() {
             s.step(dt);
         }
     }
 
     fn render(&mut self) {
-        let activity = self.activity();
+        let (now_i, now, local) = (Instant::now(), Utc::now(), Local::now());
+        let today = local.date_naive();
         let pos = self.position();
-        let now_i = Instant::now();
+        let pages = self.pages();
+        let prayer_times = self.today_prayers();
+        let day = self.water_day().clone();
+        let cfg = &self.cfg;
+
         let f = &self.focus;
         let left = f.remaining(now_i);
         let focus_left = format!("{}:{:02}", left.as_secs() / 60, left.as_secs() % 60);
-        let focus_label = f.label(&self.cfg.focus);
+        let focus_label = f.label(&cfg.focus);
+        let focus_until = if f.running() {
+            format!("until {}", (local + TimeDelta::from_std(left).unwrap_or_default()).format("%H:%M"))
+        } else if f.started {
+            "Paused".into()
+        } else {
+            format!("{} min focus · {} min break", cfg.focus.focus, cfg.focus.short_break)
+        };
+        let fraction = left.as_secs_f32() / rhythm::length(&cfg.focus, f.phase).as_secs_f32();
+        let focus_today = match self.focus_log.summary(today) {
+            s if self.focus_log.date == Some(today) && self.focus_log.minutes >= 1.0 => format!("Today · {s}"),
+            s => s,
+        };
         let focus = FocusView {
             label: &focus_label,
             left: &focus_left,
-            fraction: left.as_secs_f32() / rhythm::length(&self.cfg.focus, f.phase).as_secs_f32(),
+            until: &focus_until,
+            fraction,
             running: f.running(),
             on_break: f.phase != Phase::Focus,
             // A break comes after its focus round, so that round counts as done.
             done: if f.phase == Phase::Focus { f.round - 1 } else { f.round },
-            rounds: self.cfg.focus.rounds,
+            rounds: cfg.focus.rounds,
+            today: &focus_today,
         };
-        let tasks = self.task_rows();
-        let now = Utc::now();
-        let prayers = self.today_prayers().map(|times| {
-            let (next, coming) = match rhythm::next_prayer(&self.cfg.prayer, now) {
-                Some((i, t)) => {
-                    (times.iter().position(|x| *x == t).unwrap_or(5), format!("{} in {}", self.cfg.prayer.names[i], rhythm::until(t - now)))
-                }
-                None => (5, String::new()),
-            };
-            Prayers { names: &self.cfg.prayer.names, times: times.map(|t| t.with_timezone(&Local).format("%H:%M").to_string()), next, coming }
+
+        let hm = |t: DateTime<Utc>| t.with_timezone(&Local).format("%H:%M").to_string();
+        let next = rhythm::next_prayer(&cfg.prayer, now);
+        let prayer = prayer_times.zip(next).map(|(times, (i, t))| PrayerView {
+            names: &cfg.prayer.names,
+            times: times.map(hm),
+            next: times.iter().position(|x| *x == t).unwrap_or(5),
+            next_name: &cfg.prayer.names[i],
+            next_time: hm(t),
+            until: format!("in {}", rhythm::until(t - now)),
+            progress: rhythm::prayer_progress(&cfg.prayer, now).unwrap_or(0.0),
+            marks: times.map(|x| rhythm::arc_x(&times, x)),
+            now: rhythm::arc_x(&times, now),
         });
+
+        let (total, goal) = (day.total(), cfg.water.goal_ml.max(1));
+        let water_frac = (total as f32 / goal as f32).min(1.0);
+        let water = cfg.water.enabled.then(|| WaterView {
+            drunk: water::litres(total),
+            goal: water::litres(goal),
+            frac: water_frac,
+            by_hour: day.by_hour(),
+            hour_now: local.hour(),
+            glass: format!("{} ml", cfg.water.glass_ml),
+        });
+
+        let tasks = self.task_rows();
+        let task_scroll = self.task_scroll.min(tasks.len().saturating_sub(4));
+        let week = rhythm::week(today, &self.tasks).map(|(d, due)| (d.day(), due, d == today));
+        let mut due_today: Vec<(i64, &str)> = (self.tasks.iter())
+            .filter(|t| !t.done)
+            .filter_map(|t| t.due.map(|d| (d, t.text.as_str())))
+            .filter(|(d, _)| Local.timestamp_opt(*d, 0).single().is_some_and(|d| d.date_naive() == today))
+            .collect();
+        due_today.sort();
+        let week_line = match due_today.iter().find(|(d, _)| *d >= now.timestamp()).or(due_today.first()) {
+            None => "Nothing due today".to_string(),
+            Some((d, text)) => {
+                let at = Local.timestamp_opt(*d, 0).single().map_or(String::new(), |d| d.format(" %H:%M").to_string());
+                format!("{} due today · next: {text}{at}", due_today.len())
+            }
+        };
+        let prayer_w = next.map(|(i, t)| (cfg.prayer.names[i].clone(), hm(t), format!("in {}", rhythm::until(t - now))));
+        let (drunk, goal_l) = (water::litres(total), water::litres(goal));
+        let focus_running = if f.running() { format!("{} left", rhythm::minutes_left(left)) } else { "Not running".into() };
+        let widget = |name: &str| {
+            let name = if name == "battery" && self.battery.is_none() { "prayer" } else { name };
+            match name {
+                "week" => Widget::Week { days: week, line: &week_line },
+                "battery" => Widget::Battery { percent: self.battery.unwrap_or(0), charging: self.plugged == Some(true) },
+                "prayer" => match &prayer_w {
+                    Some((name, time, until)) => Widget::Prayer { name, time, until },
+                    None => Widget::Empty { title: "Prayer", say: "Set your location in settings" },
+                },
+                "water" => Widget::Water { drunk: &drunk, goal: &goal_l, frac: water_frac },
+                _ => Widget::Focus { today: &focus_today, running: &focus_running },
+            }
+        };
+        let widgets = [widget(&cfg.widgets.left), widget(&cfg.widgets.right)];
+
+        let byline = self
+            .np
+            .as_ref()
+            .map_or(String::new(), |n| [n.artist.as_str(), n.album.as_str()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · "));
+        let accent = self.np.as_ref().and_then(|n| n.cover.as_ref()).map_or([0.92, 0.92, 0.92], |c| c.accent);
         let music = self.np.as_ref().map(|n| Music {
             title: &n.title,
-            artist: &n.artist,
+            byline: &byline,
             pos_ms: pos,
             duration_ms: n.duration_ms,
             playing: n.playing,
             can_seek: n.can_seek,
-            accent: n.cover.as_ref().map_or([0.92, 0.92, 0.92], |c| c.accent),
+            accent,
             lines: &n.lyrics,
             line: self.line,
             lit: self.line.and_then(|i| n.lyrics.get(i)).map_or(0, |l| l.words.iter().filter(|w| w.ms <= pos).count()),
             lyrics_ready: n.lyrics_ready(),
+            lyrics_on: self.lyrics_on,
             slide: self.slide.value,
         });
+
+        let rest = self.rest();
+        let closed = match &rest {
+            Rest::Clock => Closed::Clock(&self.time),
+            Rest::Eyes => {
+                Closed::Eyes { lid: self.lid.value.clamp(0.0, 1.0), dozing: self.eyes.dozing && self.lid.value > 0.95, bounce: self.bounce.value }
+            }
+            Rest::Music => Closed::Live { left: Slot::Cover, center: &self.time, right: Slot::Bars(accent, self.hop.value) },
+            Rest::Lyric(text) => Closed::Lyric(text),
+            Rest::Focus { left, ring, round, on_break } => {
+                let c = if *on_break { TEAL } else { CORAL };
+                let right = if *on_break { Slot::Glyph(STOPWATCH, c) } else { Slot::Text(round, c) };
+                Closed::Live { left: Slot::Ring(*ring, c), center: left, right }
+            }
+            Rest::Prayer { name, until } => Closed::Live { left: Slot::Glyph(MOON, AMBER), center: name, right: Slot::Text(until, AMBER) },
+        };
+        let peek = self.peek.value;
         let scene = Scene {
-            w: self.w.value,
-            h: self.h.value,
+            w: self.w.value + 10.0 * peek,
+            h: self.h.value + 2.0 * peek,
             radius: self.radius.value.max(0.0),
             open: self.mix.value,
-            pages: self.pages(),
+            peek,
+            line: rest == Rest::Clock && self.line_mode() && self.h.value < 8.0,
+            pages: &pages,
             page: self.page.value,
-            time: &self.time,
+            hover: self.hover,
+            pressed: self.pressed,
+            press: self.press.value,
+            arrows: (self.arrow_l.value, self.arrow_r.value),
             date: &self.date,
+            time: &self.time,
             note: self.note.as_deref(),
+            focus_ring: f.running().then_some(fraction),
+            playing: self.np.as_ref().is_some_and(|n| n.playing),
             music,
             focus,
+            prayer,
+            water,
             tasks: &tasks,
-            prayers,
-            shelf: &self.shelf,
+            task_scroll,
+            widgets,
+            shelf: &self.shelf_items,
+            shelf_scroll: self.shelf_scroll,
             drop_hover: self.drop_hover,
-            activity: activity.as_ref().map(|(glyph, text)| Activity { glyph: *glyph, text }),
-            toast: self.toast.as_ref().map(|(glyph, text, level)| Toast { glyph, text, level: *level }),
+            closed,
+            toast: self.toast.as_ref().map(|p| Toast {
+                glyph: &p.glyph,
+                title: &p.title,
+                sub: p.sub.as_deref(),
+                value: p.value.as_deref(),
+                level: p.level,
+                tint: p.tint,
+                ring: p.ring,
+            }),
+            pop: self.pop.value,
         };
         if self.r.draw(&scene).is_ok() {
             let _ = self.r.present(self.hwnd, self.x, self.y);
@@ -789,8 +1228,10 @@ impl App {
         if cfg != self.cfg {
             self.cfg = cfg;
             register_hotkey(self.hwnd, &self.cfg);
+            self.eyes.set_after(self.cfg.eyes.after);
             self.prayer_cache = None;
             self.schedule_rhythm();
+            self.go_page(self.page.target); // the page list may have changed
         }
         self.rebuild();
     }
@@ -801,12 +1242,56 @@ impl App {
         ((lp.0 & 0xFFFF) as i16 as f32 * k, ((lp.0 >> 16) & 0xFFFF) as i16 as f32 * k)
     }
 
+    /// Smoothed pointer speed over the notch, in DIPs a second.
+    fn track_pointer(&mut self, x: f32, y: f32) {
+        let now = Instant::now();
+        if let Some((px, py, t)) = self.pointer {
+            let dt = (now - t).as_secs_f32().max(0.001);
+            let v = (x - px).hypot(y - py) / dt;
+            self.speed = if dt > 0.1 { v } else { 0.5 * self.speed + 0.5 * v };
+        }
+        self.pointer = Some((x, y, now));
+    }
+
+    /// The pointer moved over the open notch: what's under it lights up, the side arrows show near the sides.
+    fn hover_at(&mut self, x: f32, y: f32) {
+        let hit = self.r.hit(x, y);
+        let left = (self.r.box_w - self.w.value) / 2.0;
+        let near = |d: f32| if d < 64.0 { 1.0 } else { 0.0 };
+        let (l, r) = (near(x - left), near(left + self.w.value - x));
+        if l != self.arrow_l.target || r != self.arrow_r.target {
+            self.wake();
+            (self.arrow_l.target, self.arrow_r.target) = (l, r);
+        }
+        if hit != self.hover {
+            self.hover = hit;
+            self.render();
+        }
+    }
+
+    /// The pointer left: nothing hovered, arrows and peek fade.
+    fn unhover(&mut self) {
+        self.wake();
+        self.hovered = false;
+        self.hover = None;
+        self.pointer = None;
+        (self.arrow_l.target, self.arrow_r.target, self.peek.target) = (0.0, 0.0, 0.0);
+        self.set_open(self.open); // line style comes back
+        self.render();
+    }
+
     fn press(&mut self, x: f32, y: f32) {
         let hit = self.open.then(|| self.r.hit(x, y)).flatten();
         let seek = match hit {
             Some(Hit::Seek { left, right }) => Some(Kind::Seek { left, right }),
             _ => None,
         };
+        if let Some(h) = hit.filter(|h| !matches!(h, Hit::Seek { .. } | Hit::Line(_) | Hit::Page(_))) {
+            // Buttons sink a little under the finger.
+            self.wake();
+            self.pressed = Some(h);
+            self.press.target = 0.94;
+        }
         let start_p = if self.open { 1.0 } else { 0.0 };
         self.drag = Some(Drag { start_x: x, start_y: y, start_p, start_page: self.page.target, kind: seek.unwrap_or(Kind::Undecided), hit });
         if let Some(Kind::Seek { left, right }) = seek {
@@ -816,11 +1301,17 @@ impl App {
         self.vel.reset();
     }
 
+    fn unpress(&mut self) {
+        self.wake();
+        self.press.target = 1.0;
+    }
+
     fn drag_to(&mut self, x: f32, y: f32) {
         let Some(mut d) = self.drag else { return };
         let now = Instant::now();
         let (dx, dy) = (x - d.start_x, y - d.start_y);
         if d.kind == Kind::Undecided && dx.hypot(dy) > 4.0 {
+            self.unpress();
             if let Some(Hit::ShelfItem(i)) = d.hit {
                 // OLE runs its own drag loop; start it from the message loop, not from inside this handler.
                 self.drag = None;
@@ -863,6 +1354,7 @@ impl App {
 
     /// Mouse up: a click, or the end of a drag.
     fn let_go(&mut self, x: f32, y: f32) {
+        self.unpress();
         let Some(d) = self.drag.take() else { return };
         let now = Instant::now();
         match d.kind {
@@ -887,12 +1379,23 @@ impl App {
         }
     }
 
+    /// The wheel over the open notch scrolls the to-do list or the shelf.
+    fn scroll(&mut self, step: i32) {
+        let (at, max) = match self.page_now() {
+            Some(Page::Todo) => (&mut self.task_scroll, self.tasks.len().saturating_sub(4)),
+            Some(Page::Shelf) => (&mut self.shelf_scroll, self.shelf.len().saturating_sub(5)),
+            _ => return,
+        };
+        *at = (*at as i32 + step).clamp(0, max as i32) as usize;
+        self.render();
+    }
+
     /// Refreshes the clock strings; returns milliseconds until the next minute.
     fn update_clock(&mut self) -> u32 {
         let t = unsafe { GetLocalTime() };
         self.time = format!("{:02}:{:02}", t.wHour, t.wMinute);
         let mut buf = [0u16; 64];
-        let n = unsafe { GetDateFormatEx(PCWSTR::null(), Default::default(), Some(&t), w!("dddd, d MMMM"), Some(&mut buf), PCWSTR::null()) };
+        let n = unsafe { GetDateFormatEx(PCWSTR::null(), Default::default(), Some(&t), w!("ddd d MMM"), Some(&mut buf), PCWSTR::null()) };
         self.date = String::from_utf16_lossy(&buf[..(n.max(1) - 1) as usize]);
         (60 - t.wSecond as u32) * 1000 - t.wMilliseconds as u32
     }
@@ -1032,10 +1535,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
         match msg {
             WM_MOUSEMOVE => {
                 with_app(|a| {
+                    let (x, y) = a.to_dip(lp);
                     if a.drag.is_some() {
-                        let (x, y) = a.to_dip(lp);
                         return a.drag_to(x, y);
                     }
+                    a.track_pointer(x, y);
                     if !a.hovered {
                         a.hovered = true;
                         let mut tme =
@@ -1043,16 +1547,23 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                         let _ = TrackMouseEvent(&mut tme);
                         let _ = KillTimer(Some(hwnd), TIMER_LEAVE);
                         if !a.open {
-                            SetTimer(Some(hwnd), TIMER_DWELL, 120, None);
+                            // It heard you: a small peek now, open once the pointer settles.
+                            SetTimer(Some(hwnd), TIMER_DWELL, DWELL_MS, None);
+                            a.wake();
+                            a.peek.target = 1.0;
                         }
+                        a.set_open(a.open);
+                    }
+                    if a.open {
+                        a.hover_at(x, y);
                     }
                 });
                 LRESULT(0)
             }
             WM_MOUSELEAVE => {
                 with_app(|a| {
-                    a.hovered = false;
                     let _ = KillTimer(Some(hwnd), TIMER_DWELL);
+                    a.unhover();
                     if a.open && !a.pinned && a.drag.is_none() {
                         SetTimer(Some(hwnd), TIMER_LEAVE, 300, None);
                     }
@@ -1078,18 +1589,21 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             }
             WM_CAPTURECHANGED => {
                 // Capture taken away mid-drag (e.g. a window popped up): settle from wherever things are.
-                with_app(|a| match a.drag.map(|d| d.kind) {
-                    Some(Kind::Vertical) => a.release(a.mix.value),
-                    Some(Kind::Pages) => {
-                        a.drag = None;
-                        a.go_page(a.page.value);
+                with_app(|a| {
+                    a.unpress();
+                    match a.drag.map(|d| d.kind) {
+                        Some(Kind::Vertical) => a.release(a.mix.value),
+                        Some(Kind::Pages) => {
+                            a.drag = None;
+                            a.go_page(a.page.value);
+                        }
+                        Some(Kind::Seek { .. }) => {
+                            a.drag = None;
+                            a.seek_hold = None;
+                            a.render();
+                        }
+                        _ => a.drag = None,
                     }
-                    Some(Kind::Seek { .. }) => {
-                        a.drag = None;
-                        a.seek_hold = None;
-                        a.render();
-                    }
-                    _ => a.drag = None,
                 });
                 LRESULT(0)
             }
@@ -1104,6 +1618,27 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                         let step = a.hwheel.signum() as f32;
                         a.hwheel = 0;
                         a.go_page(a.page.target + step);
+                    }
+                });
+                LRESULT(0)
+            }
+            WM_MOUSEWHEEL => {
+                with_app(|a| {
+                    let delta = (wp.0 >> 16) as i16 as i32;
+                    if a.open {
+                        // Open: scroll the list on the page, a step every notch.
+                        a.vwheel += delta;
+                        if a.vwheel.abs() >= 120 {
+                            let step = -a.vwheel.signum();
+                            a.vwheel = 0;
+                            a.scroll(step);
+                        }
+                        return;
+                    }
+                    // Closed: volume, 2% a notch. Scrolling means "not stopping here", so no hover-open.
+                    let _ = KillTimer(Some(hwnd), TIMER_DWELL);
+                    if let Some(au) = &a.audio {
+                        au.nudge(delta as f32 / 120.0 * 0.02);
                     }
                 });
                 LRESULT(0)
@@ -1125,6 +1660,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                     VK_ESCAPE => a.unpin(true),
                     VK_LEFT => a.go_page(a.page.target - 1.0),
                     VK_RIGHT => a.go_page(a.page.target + 1.0),
+                    VK_UP => a.scroll(-1),
+                    VK_DOWN => a.scroll(1),
                     VK_SPACE => a.media.toggle(),
                     _ => {}
                 });
@@ -1137,12 +1674,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             WM_VOLUME => {
                 let (level, muted) = ((wp.0 & 0xFFFF) as f32 / 1000.0, wp.0 >> 16 & 1 == 1);
                 with_app(|a| {
-                    a.show_toast(
-                        system::volume_glyph(level, muted),
-                        format!("{}", (level * 100.0).round()),
-                        Some(if muted { 0.0 } else { level }),
-                        1600,
-                    )
+                    let pop = Pop {
+                        value: Some(format!("{}", (level * 100.0).round())),
+                        level: Some(if muted { 0.0 } else { level }),
+                        ..Pop::new(system::volume_glyph(level, muted), "")
+                    };
+                    a.show_toast(pop, 1600)
                 });
                 LRESULT(0)
             }
@@ -1151,7 +1688,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                     if let Some(name) = a.audio.as_mut().and_then(|au| au.follow_default()) {
                         let l = name.to_lowercase();
                         let ears = ["headphone", "headset", "earbud", "buds", "airpods"].iter().any(|w| l.contains(w));
-                        a.show_toast(if ears { "\u{E7F6}" } else { "\u{E7F5}" }, name, None, 2500);
+                        a.show_toast(Pop::new(if ears { "\u{E7F6}" } else { "\u{E7F5}" }, name).sub("Sound plays here now"), 2500);
                     }
                 });
                 LRESULT(0)
@@ -1159,7 +1696,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             WM_CAPS => {
                 // The hook fires on key up, after Windows has flipped the toggle.
                 let on = GetKeyState(VK_CAPITAL.0 as i32) & 1 == 1;
-                with_app(|a| a.show_toast("\u{E765}", format!("Caps Lock {}", if on { "on" } else { "off" }), None, 1600));
+                with_app(|a| a.show_toast(Pop::new("\u{E765}", format!("Caps Lock {}", if on { "on" } else { "off" })), 1600));
                 LRESULT(0)
             }
             WM_POWERBROADCAST => {
@@ -1169,19 +1706,6 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                     with_app(|a| a.on_power(p));
                 }
                 LRESULT(1)
-            }
-            WM_MOUSEWHEEL => {
-                // Scroll on the closed pill: volume, 2% a notch. Scrolling means "not peeking", so no hover-open.
-                with_app(|a| {
-                    if !a.open {
-                        let _ = KillTimer(Some(hwnd), TIMER_DWELL);
-                        let notches = (wp.0 >> 16) as i16 as f32 / 120.0;
-                        if let Some(au) = &a.audio {
-                            au.nudge(notches * 0.02);
-                        }
-                    }
-                });
-                LRESULT(0)
             }
             WM_HOTKEY => {
                 match wp.0 as i32 {
@@ -1213,8 +1737,17 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                     TIMER_DWELL => {
                         let _ = KillTimer(Some(hwnd), TIMER_DWELL);
                         with_app(|a| {
-                            if a.hovered && !a.open {
-                                a.set_open(true)
+                            if !a.hovered || a.open {
+                                return;
+                            }
+                            // Not while a button is held (dragging a window up there), nor while the pointer is still
+                            // on its way somewhere: look again in a moment.
+                            let held = GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 || GetAsyncKeyState(VK_RBUTTON.0 as i32) < 0;
+                            let moving = a.speed > PASSING && a.pointer.is_some_and(|(_, _, t)| t.elapsed() < Duration::from_millis(80));
+                            if held || moving {
+                                SetTimer(Some(hwnd), TIMER_DWELL, 90, None);
+                            } else {
+                                a.set_open(true);
                             }
                         });
                     }
@@ -1236,6 +1769,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                     TIMER_RHYTHM => {
                         with_app(|a| a.tick_rhythm());
                     }
+                    TIMER_EYES => {
+                        with_app(|a| a.on_eyes());
+                    }
                     TIMER_TOAST => {
                         let _ = KillTimer(Some(hwnd), TIMER_TOAST);
                         with_app(|a| {
@@ -1247,7 +1783,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                     TIMER_MEDIA => {
                         with_app(|a| {
                             a.update_line(true);
-                            a.set_open(a.open); // a new lyric line resizes the closed pill
+                            a.set_open(a.open); // a new lyric line resizes the closed pill when lyrics_in_pill is on
                             a.render();
                             a.schedule();
                         });
@@ -1384,10 +1920,23 @@ fn run() -> Result<()> {
             h: shape(t.closed_height),
             radius: shape(t.closed_height / 2.0),
             mix: Spring { eps: 0.004, ..Spring::new(0.0, 300.0, 30.0) },
+            peek: Spring { eps: 0.004, ..Spring::new(0.0, 300.0, 24.0) },
+            press: Spring { eps: 0.002, ..Spring::new(1.0, 600.0, 22.0) },
+            pressed: None,
+            hover: None,
+            arrow_l: Spring { eps: 0.004, ..Spring::new(0.0, 260.0, 30.0) },
+            arrow_r: Spring { eps: 0.004, ..Spring::new(0.0, 260.0, 30.0) },
+            pop: Spring { eps: 0.004, ..Spring::new(1.0, 420.0, 20.0) },
+            hop: Spring { eps: 0.004, ..Spring::new(0.0, 160.0, 9.0) },
+            lid: Spring { eps: 0.004, ..Spring::new(0.0, 900.0, 60.0) },
+            bounce: Spring { eps: 0.004, ..Spring::new(0.0, 300.0, 14.0) },
+            eyes: Eyes::new(cfg.eyes.after, Instant::now()),
             cfg,
             note,
             last: Instant::now(),
             hovered: false,
+            pointer: None,
+            speed: 0.0,
             open: false,
             pinned: false,
             prev_focus: HWND::default(),
@@ -1400,22 +1949,32 @@ fn run() -> Result<()> {
             page: Spring { eps: 0.002, ..Spring::new(0.0, 300.0, 30.0) },
             slide: Spring { eps: 0.004, ..Spring::new(0.0, 220.0, 26.0) },
             line: None,
+            lyrics_on: true,
             hwheel: 0,
+            vwheel: 0,
+            task_scroll: 0,
+            shelf_scroll: 0,
             seek_hold: None,
             audio: Audio::start(hwnd).ok(),
             toast: None,
             plugged: None,
             battery: None,
             focus: Focus::new(&cfg_focus),
+            focus_log: FocusLog::load(),
             tasks: rhythm::load_tasks(),
+            water: water::load(Local::now().date_naive()),
+            quiet: false,
             prayer_cache: None,
             prayer_seen: Utc::now(),
             shelf: shelf::load(),
+            shelf_items: Vec::new(),
             drop_hover: false,
             drop_opened: false,
         };
         let _ = shelf::accept_drops(hwnd);
+        app.refresh_shelf();
         app.schedule_rhythm();
+        app.schedule_eyes();
         app.tune_springs();
         app.place();
         let ms = app.update_clock();

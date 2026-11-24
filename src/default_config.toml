@@ -6,14 +6,20 @@ hotkey = "Ctrl+Alt+N"
 
 # Your skin. Colours are #RRGGBB or #RRGGBBAA; sizes are in DIPs (pixels at 100% scaling).
 [theme]
-background = "#000000"
+# "pill", or "line": while nothing is happening the notch shrinks to a thin line (handy with a thick top bezel).
+style = "pill"
+background = "#0B0B0D"
 text = "#FFFFFF"
 font = "Segoe UI Variable Text"
-closed_width = 128
-closed_height = 30
-open_width = 400
-open_height = 170
-radius = 32
+closed_width = 120
+closed_height = 26
+open_width = 540
+open_height = 160
+radius = 30
+
+[music]
+# Show the line being sung in the closed notch. It then grows to fit the line, over whatever is below it.
+lyrics_in_pill = false
 
 # Focus timer lengths in minutes; a long break comes after `rounds` focus sessions.
 [focus]
@@ -38,6 +44,25 @@ madhab = "shafi"
 names = ["Fajr", "Dhuhr", "Asr", "Maghrib", "Isha"]
 # Pause the music when it's time to pray.
 pause_music = true
+
+# Water: a daily goal, a Drink button, and a nudge when you fall behind during your hours.
+[water]
+enabled = true
+goal_ml = 2000
+glass_ml = 250
+start = "08:00"
+end = "22:00"
+# Minutes between nudges while you're behind; 0 turns them off.
+remind_every = 60
+
+# The Widgets page shows two cards: "week", "battery", "prayer", "water" or "focus".
+[widgets]
+left = "week"
+right = "battery"
+
+# When nothing is happening for this many seconds, the clock gives way to two eyes. 0 turns them off.
+[eyes]
+after = 60
 
 # Jot: the hotkey opens a box, and what you type is added to this file with the date and time.
 [jot]

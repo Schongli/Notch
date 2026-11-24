@@ -10,9 +10,46 @@ pub const DEFAULT: &str = include_str!("default_config.toml");
 pub struct Config {
     pub hotkey: String,
     pub theme: Theme,
+    pub music: Music,
     pub focus: Focus,
     pub prayer: Prayer,
+    pub water: Water,
+    pub widgets: Widgets,
+    pub eyes: Eyes,
     pub jot: Jot,
+}
+
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Music {
+    pub lyrics_in_pill: bool,
+}
+
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Water {
+    pub enabled: bool,
+    pub goal_ml: u32,
+    pub glass_ml: u32,
+    pub start: String,
+    pub end: String,
+    pub remind_every: u32,
+}
+
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Widgets {
+    pub left: String,
+    pub right: String,
+}
+
+pub const WIDGETS: [&str; 5] = ["week", "battery", "prayer", "water", "focus"];
+
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Eyes {
+    /// Seconds of nothing happening before the eyes come out; 0 = never
+    pub after: u32,
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq)]
@@ -47,6 +84,7 @@ pub struct Jot {
 #[derive(Deserialize, Clone, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Theme {
+    pub style: String,
     pub background: String,
     pub text: String,
     pub font: String,
@@ -67,7 +105,8 @@ impl Config {
     /// Parses the user's file over the defaults, so a file with only some keys still works.
     pub fn parse(user: &str) -> Result<Self, String> {
         let mut base: toml::Table = DEFAULT.parse().map_err(|e| format!("{e}"))?;
-        let user: toml::Table = user.parse().map_err(|e: toml::de::Error| e.message().to_string())?;
+        let mut user: toml::Table = user.parse().map_err(|e: toml::de::Error| e.message().to_string())?;
+        forget_old_defaults(&mut user);
         for (k, v) in user {
             match (base.get_mut(&k), v) {
                 (Some(toml::Value::Table(b)), toml::Value::Table(u)) => b.extend(u),
@@ -97,6 +136,20 @@ impl Config {
         if p.names.len() != 5 {
             return Err("prayer.names needs five names, Fajr to Isha".into());
         }
+        if c.theme.style != "pill" && c.theme.style != "line" {
+            return Err(format!("theme.style: \"{}\" should be \"pill\" or \"line\"", c.theme.style));
+        }
+        for (name, v) in [("water.start", &c.water.start), ("water.end", &c.water.end)] {
+            chrono::NaiveTime::parse_from_str(v, "%H:%M").map_err(|_| format!("{name}: \"{v}\" isn't a time like 08:00"))?;
+        }
+        if c.water.goal_ml == 0 || c.water.glass_ml == 0 {
+            return Err("water.goal_ml and water.glass_ml must be more than 0".into());
+        }
+        for (name, v) in [("widgets.left", &c.widgets.left), ("widgets.right", &c.widgets.right)] {
+            if !WIDGETS.contains(&v.as_str()) {
+                return Err(format!("{name}: \"{v}\" should be one of {}", WIDGETS.join(", ")));
+            }
+        }
         Ok(c)
     }
 
@@ -112,6 +165,26 @@ impl Config {
                 let _ = std::fs::create_dir_all(path.parent().unwrap());
                 let _ = std::fs::write(&path, DEFAULT);
                 (Self::default(), None)
+            }
+        }
+    }
+}
+
+/// 0.1 wrote its defaults into every config.toml. A theme key still holding its 0.1 value was never chosen,
+/// so it's dropped and 0.2's default applies; a value someone changed stays.
+fn forget_old_defaults(user: &mut toml::Table) {
+    let old: [(&str, toml::Value); 6] = [
+        ("background", "#000000".into()),
+        ("closed_width", 128.into()),
+        ("closed_height", 30.into()),
+        ("open_width", 400.into()),
+        ("open_height", 170.into()),
+        ("radius", 32.into()),
+    ];
+    if let Some(toml::Value::Table(theme)) = user.get_mut("theme") {
+        for (key, value) in old {
+            if theme.get(key) == Some(&value) {
+                theme.remove(key);
             }
         }
     }
@@ -166,7 +239,18 @@ mod tests {
     fn defaults_parse() {
         let c = Config::default();
         assert_eq!(c.hotkey, "Ctrl+Alt+N");
-        assert_eq!(c.theme.open_width, 400.0);
+        assert_eq!(c.theme.open_width, 540.0);
+        assert_eq!(c.eyes.after, 60);
+    }
+
+    #[test]
+    fn old_defaults_give_way_to_new_ones() {
+        // What 0.1 wrote, plus one size the user really changed.
+        let v01 = "[theme]\nbackground = \"#000000\"\nclosed_width = 128\nclosed_height = 30\nopen_width = 400\nopen_height = 200\nradius = 32\n";
+        let t = Config::parse(v01).unwrap().theme;
+        assert_eq!((t.background.as_str(), t.closed_width, t.closed_height, t.open_width, t.radius), ("#0B0B0D", 120.0, 26.0, 540.0, 30.0));
+        assert_eq!(t.open_height, 200.0, "a changed value stays");
+        assert_eq!(Config::parse("[theme]\nbackground = \"#101010\"").unwrap().theme.background, "#101010");
     }
 
     #[test]
@@ -187,6 +271,10 @@ mod tests {
         assert!(Config::parse("[prayer]\nnames = [\"Subuh\"]").unwrap_err().contains("five"));
         assert!(Config::parse("[prayer]\nlatitude = 120.0").unwrap_err().contains("latitude"));
         assert!(Config::parse("[jot]\nhotkey = \"Ctrl+Alt+N\"").unwrap_err().contains("same keys"));
+        assert!(Config::parse("[theme]\nstyle = \"blob\"").unwrap_err().contains("theme.style"));
+        assert!(Config::parse("[water]\nstart = \"8am\"").unwrap_err().contains("water.start"));
+        assert!(Config::parse("[water]\ngoal_ml = 0").unwrap_err().contains("goal_ml"));
+        assert!(Config::parse("[widgets]\nleft = \"weather\"").unwrap_err().contains("widgets.left"));
     }
 
     #[test]

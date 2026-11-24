@@ -1,0 +1,2 @@
+# Drawing helpers take a position, a size, a colour and an opacity; that is a lot of plain numbers by nature.
+too-many-arguments-threshold = 9

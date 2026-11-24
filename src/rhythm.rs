@@ -89,6 +89,55 @@ impl Focus {
     }
 }
 
+impl Focus {
+    /// Focused time so far in the current focus phase (0 on a break).
+    pub fn focused(&self, cfg: &FocusCfg, now: Instant) -> Duration {
+        if self.phase == Phase::Focus && self.started { length(cfg, Phase::Focus).saturating_sub(self.remaining(now)) } else { Duration::ZERO }
+    }
+}
+
+/// Today's focus: minutes and finished sessions, kept across restarts in focus.json.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct FocusLog {
+    pub date: Option<NaiveDate>,
+    pub minutes: f32,
+    pub sessions: u32,
+}
+
+impl FocusLog {
+    /// Adds a stretch of focus to today (a new day starts from zero); `finished` counts a session.
+    pub fn add(&mut self, today: NaiveDate, focused: Duration, finished: bool) {
+        if self.date != Some(today) {
+            *self = FocusLog { date: Some(today), ..Default::default() };
+        }
+        self.minutes += focused.as_secs_f32() / 60.0;
+        self.sessions += finished as u32;
+    }
+
+    /// "2 h 10 min · 4 sessions"
+    pub fn summary(&self, today: NaiveDate) -> String {
+        if self.date != Some(today) || self.minutes < 1.0 {
+            return "Nothing yet today".into();
+        }
+        let m = self.minutes.round() as i64;
+        let time = if m >= 60 { format!("{} h {} min", m / 60, m % 60) } else { format!("{m} min") };
+        let n = self.sessions;
+        format!("{time} · {n} session{}", if n == 1 { "" } else { "s" })
+    }
+
+    pub fn load() -> Self {
+        data_dir().and_then(|d| std::fs::read_to_string(d.join("focus.json")).ok()).and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+    }
+
+    pub fn save(&self) {
+        let Some(dir) = data_dir() else { return };
+        let _ = std::fs::create_dir_all(&dir);
+        if let Ok(json) = serde_json::to_string(self) {
+            let _ = std::fs::write(dir.join("focus.json"), json);
+        }
+    }
+}
+
 /// "18 min", or "45 s" in the last minute: for the closed pill, which redraws once a minute.
 pub fn minutes_left(d: Duration) -> String {
     let s = d.as_secs();
@@ -120,6 +169,22 @@ pub fn next_prayer(cfg: &PrayerCfg, now: DateTime<Utc>) -> Option<(usize, DateTi
         }
     }
     None
+}
+
+/// How far `now` is from the last prayer to the next one, 0..1 (yesterday's Isha counts before today's Fajr).
+pub fn prayer_progress(cfg: &PrayerCfg, now: DateTime<Utc>) -> Option<f32> {
+    let today = now.with_timezone(&Local).date_naive();
+    let (_, next) = next_prayer(cfg, now)?;
+    let mut past: Vec<DateTime<Utc>> = prayer_day(cfg, today.pred_opt()?)?.into();
+    past.extend(prayer_day(cfg, today)?);
+    let prev = past.into_iter().filter(|t| *t <= now).max()?;
+    Some(((now - prev).num_seconds() as f32 / (next - prev).num_seconds().max(1) as f32).clamp(0.0, 1.0))
+}
+
+/// Where `t` sits on the day's arc from Fajr (0) to Isha (1).
+pub fn arc_x(times: &[DateTime<Utc>; 5], t: DateTime<Utc>) -> f32 {
+    let span = (times[4] - times[0]).num_seconds().max(1) as f32;
+    ((t - times[0]).num_seconds() as f32 / span).clamp(0.0, 1.0)
 }
 
 /// "1 h 8 min", "12 min", "now"
@@ -199,6 +264,17 @@ pub fn next_at(t: NaiveTime, now: DateTime<Local>) -> DateTime<Local> {
     if first > now { first } else { at(today + chrono::Days::new(1)) }
 }
 
+/// This week, Monday first: each day and whether an open task is due on it.
+pub fn week(today: NaiveDate, tasks: &[Task]) -> [(NaiveDate, bool); 7] {
+    use chrono::Datelike;
+    let monday = today - chrono::Days::new(today.weekday().num_days_from_monday() as u64);
+    std::array::from_fn(|i| {
+        let day = monday + chrono::Days::new(i as u64);
+        let due = tasks.iter().any(|t| !t.done && t.due.and_then(|s| Local.timestamp_opt(s, 0).single()).is_some_and(|d| d.date_naive() == day));
+        (day, due)
+    })
+}
+
 // ---------- Jot
 
 /// Appends "- 2026-11-23 14:02 the idea" to the jot file, creating it (and its folder) the first time.
@@ -246,6 +322,56 @@ mod tests {
         f.toggle(t0 + Duration::from_secs(300));
         assert!(!f.running());
         assert_eq!(f.remaining(t0 + Duration::from_secs(9999)), Duration::from_secs(20 * 60));
+    }
+
+    #[test]
+    fn focus_log_per_day() {
+        let day = NaiveDate::from_ymd_opt(2026, 11, 24).unwrap();
+        let mut log = FocusLog::default();
+        assert_eq!(log.summary(day), "Nothing yet today");
+        log.add(day, Duration::from_secs(25 * 60), true);
+        log.add(day, Duration::from_secs(105 * 60), true);
+        assert_eq!(log.summary(day), "2 h 10 min · 2 sessions");
+        log.add(day, Duration::from_secs(5 * 60), false);
+        assert_eq!(log.sessions, 2, "a skipped focus counts its minutes, not a session");
+        log.add(day.succ_opt().unwrap(), Duration::from_secs(25 * 60), true);
+        assert_eq!(log.summary(day.succ_opt().unwrap()), "25 min · 1 session", "a new day starts over");
+    }
+
+    #[test]
+    fn focused_so_far() {
+        let cfg = focus_cfg();
+        let t0 = Instant::now();
+        let mut f = Focus::new(&cfg);
+        assert_eq!(f.focused(&cfg, t0), Duration::ZERO);
+        f.toggle(t0);
+        assert_eq!(f.focused(&cfg, t0 + Duration::from_secs(600)), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn arc_and_progress() {
+        let cfg = jakarta(0);
+        let times = prayer_day(&cfg, NaiveDate::from_ymd_opt(2026, 11, 23).unwrap()).unwrap();
+        assert_eq!(arc_x(&times, times[0]), 0.0);
+        assert_eq!(arc_x(&times, times[4]), 1.0);
+        assert!((0.4..0.6).contains(&arc_x(&times, times[1])), "Dhuhr sits near the middle of Fajr..Isha");
+        let mid = times[1] + (times[2] - times[1]) / 2;
+        let p = prayer_progress(&cfg, mid).unwrap();
+        assert!((0.45..0.55).contains(&p), "half way from Dhuhr to Asr: {p}");
+    }
+
+    #[test]
+    fn week_with_due_dots() {
+        let today = NaiveDate::from_ymd_opt(2026, 11, 25).unwrap(); // a Wednesday
+        let at = |d: u32, done| Task {
+            text: "x".into(),
+            due: Some(Local.with_ymd_and_hms(2026, 11, d, 15, 0, 0).unwrap().timestamp()),
+            done,
+            reminded: false,
+        };
+        let w = week(today, &[at(27, false), at(23, false), at(28, true)]);
+        assert_eq!(w[0].0, NaiveDate::from_ymd_opt(2026, 11, 23).unwrap(), "Monday first");
+        assert_eq!(w.iter().map(|d| d.1).collect::<Vec<_>>(), [true, false, false, false, true, false, false], "done tasks don't count");
     }
 
     #[test]
